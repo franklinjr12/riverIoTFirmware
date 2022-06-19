@@ -1,5 +1,4 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// SPDX-License-Identifier: MIT
+// Copyright(c) Microsoft Corporation.All rights reserved.SPDX - License - Identifier : MIT
 
 #include <cstdlib>
 #include <string.h>
@@ -7,6 +6,8 @@
 
 #include <WiFi.h>
 #include <mqtt_client.h>
+
+#include <PubSubClient.h>
 
 #include <az_iot_hub_client.h>
 #include <az_result.h>
@@ -16,6 +17,8 @@
 #include "SerialLogger.h"
 #include "ca.h"
 #include "iot_configs.h"
+
+#include "sim800Interface.hpp"
 
 #include "my_bmp280.h"
 #include "my_ultrassonic.h"
@@ -27,13 +30,15 @@
 #define SAS_TOKEN_DURATION_IN_MINUTES 60
 #define UNIX_TIME_NOV_13_2017 1510592825
 
-#define TIME_TO_SLEEP (60 * 1000000)
+// #define TIME_TO_SLEEP (30 * 1000000) // each 30s
+#define TIME_TO_SLEEP (5 * 60 * 1000000) // each 30s
 
-#define PST_TIME_ZONE -8
-#define PST_TIME_ZONE_DST_DIFF 1
-
-#define GMT_OFFSET_SECS (PST_TIME_ZONE * 3600)
-#define GMT_OFFSET_SECS_DST ((PST_TIME_ZONE + PST_TIME_ZONE_DST_DIFF) * 3600)
+// #define PST_TIME_ZONE -8
+// #define PST_TIME_ZONE_DST_DIFF 1
+// #define GMT_OFFSET_SECS (PST_TIME_ZONE * 3600)
+// #define GMT_OFFSET_SECS_DST ((PST_TIME_ZONE + PST_TIME_ZONE_DST_DIFF) * 3600)
+#define GMT_OFFSET_SECS (5 * 3600)
+#define GMT_OFFSET_SECS_DST (0 * 3600)
 
 static const char *ssid = IOT_CONFIG_WIFI_SSID;
 static const char *password = IOT_CONFIG_WIFI_PASSWORD;
@@ -56,9 +61,14 @@ static char telemetry_topic[128];
 static uint8_t telemetry_payload[200];
 static uint32_t telemetry_send_count = 0;
 
-const int len = 150;
+const int len = 200;
 char buf[len];
 float vbat = 0;
+
+bool mqtt_connected = false;
+
+sim800InterfaceData sim800;
+PubSubClient *mqttClient;
 
 float read_battery() { return (((float)analogRead(pin_battery)) * 1.1736334 * 3.3 * 2.0) / 4096.0; }
 
@@ -67,6 +77,13 @@ static AzIoTSasToken sasToken(
     AZ_SPAN_FROM_STR(IOT_CONFIG_DEVICE_KEY),
     AZ_SPAN_FROM_BUFFER(sas_signature_buffer),
     AZ_SPAN_FROM_BUFFER(mqtt_password));
+
+int connectInternet()
+{
+  int err = 0;
+
+  return err;
+}
 
 static void connectToWiFi()
 {
@@ -83,8 +100,11 @@ static void connectToWiFi()
     Serial.print(".");
     t2 = millis();
   }
-  if (t2 - t1 > timeout)
+  if (t2 - t1 >= timeout)
+  {
+    Serial.println("Error connecting to wifi");
     ESP.restart();
+  }
 
   Serial.println("");
 
@@ -107,8 +127,11 @@ static void initializeTime()
     Serial.print(".");
     now = time(nullptr);
   }
-  if (t2 - t1 > timeout)
+  if (t2 - t1 >= timeout)
+  {
+    Serial.println("Error setting SNTP timeout");
     ESP.restart();
+  }
   Serial.println("");
   Logger.Info("Time initialized!");
 }
@@ -132,6 +155,7 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
     Logger.Info("MQTT event MQTT_EVENT_ERROR");
     break;
   case MQTT_EVENT_CONNECTED:
+    mqtt_connected = true;
     Logger.Info("MQTT event MQTT_EVENT_CONNECTED");
     break;
   case MQTT_EVENT_DISCONNECTED:
@@ -197,7 +221,6 @@ static int initializeMqttClient()
     Logger.Error("Failed generating SAS token");
     return 1;
   }
-
   esp_mqtt_client_config_t mqtt_config;
   memset(&mqtt_config, 0, sizeof(mqtt_config));
   mqtt_config.uri = mqtt_broker_uri;
@@ -238,24 +261,13 @@ static uint32_t getEpochTimeInSecs() { return (uint32_t)time(NULL); }
 
 static int establishConnection()
 {
+  int err = 0;
+  err = connectInternet();
   connectToWiFi();
   initializeTime();
   initializeIoTHubClient();
   (void)initializeMqttClient();
-}
-
-void setup()
-{
-  bmp280_setup();
-  ultrassonic_setup();
-  pinMode(pin_battery, INPUT);
-  const int samples = 4;
-  vbat = 0;
-  for (int i = 0; i < samples; i++)
-  {
-    vbat += read_battery() / samples;
-  }
-  establishConnection();
+  return err;
 }
 
 static void getTelemetryPayload(az_span payload, az_span *out_payload)
@@ -278,7 +290,7 @@ static void getTelemetryPayload(az_span payload, az_span *out_payload)
       data.T,
       data.A,
       time(NULL));
-  Serial.println(buf);
+  Serial.printf("buf len %d buf content: %s\n", strlen(buf), buf);
   payload = az_span_copy(payload, az_span_create_from_str(buf));
   *out_payload = az_span_slice(original_payload, 0, az_span_size(original_payload) - az_span_size(payload));
 }
@@ -298,9 +310,7 @@ static void sendTelemetry()
     Logger.Error("Failed az_iot_hub_client_telemetry_get_publish_topic");
     return;
   }
-
   getTelemetryPayload(telemetry, &telemetry);
-
   if (esp_mqtt_client_publish(
           mqtt_client,
           telemetry_topic,
@@ -324,8 +334,56 @@ static void sendTelemetry()
   }
 }
 
+void setup()
+{
+  Serial.println("Setup begin");
+  if (sim800InterfaceSetup(&sim800) == 0)
+  {
+    Serial.println("sim800 initiated");
+  }
+  else
+  {
+    Serial.println("sim800 fail to initiate");
+    while (1)
+      ;
+  }
+  if (sim800InterfaceSetCert(&sim800) == 0)
+  {
+    Serial.println("sim800 cert setted");
+  }
+  else
+  {
+    Serial.println("sim800 fail to set cert");
+    while (1)
+      ;
+  }
+  delay(10000); // time for sim800 network connection
+  // digitalWrite(PWR, LOW);
+
+  bmp280_setup();
+  Serial.println("bmp280 initiated");
+  ultrassonic_setup();
+  Serial.println("ultrassonic initiated");
+  pinMode(pin_battery, INPUT);
+  const int samples = 4;
+  vbat = 0;
+  for (int i = 0; i < samples; i++)
+  {
+    vbat += read_battery() / samples;
+  }
+  Serial.println("battery read");
+
+  mqttClient = new PubSubClient(*sim800.gsm_cli);
+  mqttClient->setServer(host, mqtt_port);
+  establishConnection();
+  Serial.println("connection initiated");
+}
+
 void loop()
 {
+  // Serial.println("Hello");
+  // while (1)
+  //   ;
   if (WiFi.status() != WL_CONNECTED)
   {
     connectToWiFi();
@@ -339,6 +397,8 @@ void loop()
   else if (millis() > next_telemetry_send_time_ms)
   {
     sendTelemetry();
+    digitalWrite(PWR, LOW);
+    Serial.println("Entering deep sleep");
     esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP);
     esp_deep_sleep_start();
     next_telemetry_send_time_ms = millis() + TELEMETRY_FREQUENCY_MILLISECS;
